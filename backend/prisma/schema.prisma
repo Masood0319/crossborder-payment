@@ -1,0 +1,533 @@
+// ============================================================================
+// PostgreSQL Prisma Schema: Double-Entry Ledger, Nostro/Vostro Balances & Audits
+// ============================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum EntryDirection {
+  DEBIT
+  CREDIT
+}
+
+enum TransactionStatus {
+  PENDING
+  POSTED
+  REJECTED
+  REVERSED
+}
+
+enum PaymentRail {
+  RAAST_PK
+  AANI_UAE
+  SARIE_KSA
+}
+
+enum IsoMessageStatus {
+  ACCP // Accepted Customer Credit Transfer
+  RJCT // Rejected
+  PDNG // Pending Clearing
+}
+
+enum FxQuoteState {
+  ACTIVE
+  CONSUMED
+  EXPIRED
+  CANCELLED
+}
+
+enum TransferStatus {
+  INITIATED
+  VALIDATING
+  QUOTED
+  FUNDS_DEBITED
+  SUBMITTED
+  ACCEPTED
+  SETTLED
+  FAILED
+  REJECTED
+  RETURNED
+  CANCELLED
+  SIMULATED
+  REVERSED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum BeneficiaryVerificationStatus {
+  UNVERIFIED
+  FORMAT_VALIDATED
+  VERIFIED
+}
+
+enum CallbackSource {
+  SIMULATED
+  EXTERNAL_UNVERIFIED
+}
+
+enum CallbackProcessingStatus {
+  RECEIVED
+  FAILED
+  IGNORED_SIMULATED
+}
+
+enum ReconciliationStatus {
+  UNRECONCILED
+  MATCHED
+  MISMATCHED
+  MISSING_EXTERNAL
+  MISSING_INTERNAL
+}
+
+enum KycReviewAction {
+  REVIEW
+  CORRECTION
+}
+
+enum PartnerIdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum TreasuryAuditEventType {
+  LIQUIDITY_ALERT_ACKNOWLEDGED
+  TREASURY_ACCESS
+}
+
+model Account {
+  id             String      @id @default(uuid()) @db.Uuid
+  accountNumber  String      @unique @db.VarChar(64)
+  name           String      @db.VarChar(128)
+  type           AccountType
+  currency       String      @db.VarChar(3)
+  bankIdentifier String?     @db.VarChar(11) // BIC / SWIFT
+  iban           String?     @db.VarChar(34)
+  currentBalance Decimal     @default(0.0) @db.Decimal(18, 4)
+  isActive       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  entries        Entry[]
+  nostroBalances NostroVostroBalance[]
+  wallet         Wallet?
+
+  @@index([currency])
+  @@index([bankIdentifier])
+  @@map("accounts")
+}
+
+model Transaction {
+  id              String            @id @default(uuid()) @db.Uuid
+  reference       String            @unique @db.VarChar(64)
+  uetr            String?           @unique @db.Uuid
+  type            String            @db.VarChar(32)
+  corridorCode    String            @db.VarChar(16)
+  status          TransactionStatus @default(PENDING)
+  totalDebitBase  Decimal           @db.Decimal(18, 4)
+  totalCreditBase Decimal           @db.Decimal(18, 4)
+  currency        String            @default("USD") @db.VarChar(3)
+  description     String?           @db.VarChar(255)
+  postedAt        DateTime?
+  reversalOfId    String?           @unique @map("reversal_of_id") @db.Uuid
+  reversalReason  String?           @map("reversal_reason") @db.VarChar(255)
+  reversedAt      DateTime?         @map("reversed_at")
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  entries          Entry[]
+  isoAuditLogs     IsoMessageAudit[]
+  walletActivities WalletActivity[]
+  transfer         Transfer?
+  callbackInbox    CallbackInbox[]
+  reconciliationRecords ReconciliationRecord[]
+  reversalOf       Transaction?      @relation("TransactionReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversals        Transaction[]     @relation("TransactionReversal")
+
+  @@index([uetr])
+  @@index([corridorCode])
+  @@index([status])
+  @@map("transactions")
+}
+
+model Entry {
+  id            String         @id @default(uuid()) @db.Uuid
+  transactionId String         @map("transaction_id") @db.Uuid
+  accountId     String         @map("account_id") @db.Uuid
+  direction     EntryDirection
+  amount        Decimal        @db.Decimal(18, 4)
+  currency      String         @db.VarChar(3)
+  exchangeRate  Decimal        @default(1.0) @map("exchange_rate") @db.Decimal(14, 6)
+  baseAmount    Decimal        @map("base_amount") @db.Decimal(18, 4)
+  sequenceOrder Int            @map("sequence_order")
+  description   String?        @db.VarChar(255)
+  createdAt     DateTime       @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@unique([transactionId, sequenceOrder])
+  @@index([transactionId])
+  @@index([accountId])
+  @@map("entries")
+}
+
+model NostroVostroBalance {
+  id               String   @id @default(uuid()) @db.Uuid
+  accountId        String   @map("account_id") @db.Uuid
+  bankCode         String   @map("bank_code") @db.VarChar(11) // BIC
+  bankName         String   @map("bank_name") @db.VarChar(128)
+  currency         String   @db.VarChar(3)
+  currentBalance   Decimal  @map("current_balance") @db.Decimal(18, 4)
+  reservedBalance  Decimal  @default(0.0) @map("reserved_balance") @db.Decimal(18, 4)
+  availableBalance Decimal  @map("available_balance") @db.Decimal(18, 4)
+  minimumThreshold Decimal  @map("minimum_threshold") @db.Decimal(18, 4)
+  maximumThreshold Decimal  @map("maximum_threshold") @db.Decimal(18, 4)
+  targetBalance    Decimal  @map("target_balance") @db.Decimal(18, 4)
+  lastReconciledAt DateTime @default(now()) @map("last_reconciled_at")
+
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@unique([bankCode, currency])
+  @@map("nostro_vostro_balances")
+}
+
+model Corridor {
+  id                  String      @id @default(uuid()) @db.Uuid
+  code                String      @unique @db.VarChar(16) // e.g. PK_AE
+  sourceCurrency      String      @db.VarChar(3)
+  targetCurrency      String      @db.VarChar(3)
+  sourceRail          PaymentRail
+  destinationRail     PaymentRail
+  baseSpreadBps       Int         @default(30)
+  volatilityBufferBps Int         @default(10)
+  quoteTtlSeconds     Int         @default(60)
+  minTransferAmount   Decimal     @db.Decimal(18, 4)
+  maxTransferAmount   Decimal     @db.Decimal(18, 4)
+  isActive            Boolean     @default(true)
+  createdAt           DateTime    @default(now())
+
+  fxQuotes FxQuote[]
+
+  @@map("corridors")
+}
+
+model FxQuote {
+  id                  String       @id @default(uuid()) @db.Uuid
+  quoteId             String       @unique @db.Uuid
+  userId              String?      @map("user_id") @db.Uuid
+  idempotencyKey      String?      @map("idempotency_key") @db.VarChar(64)
+  corridorCode        String       @db.VarChar(16)
+  sourceCurrency      String       @db.VarChar(3)
+  targetCurrency      String       @db.VarChar(3)
+  instructedAmount    Decimal      @db.Decimal(18, 4)
+  settlementAmount    Decimal      @db.Decimal(18, 4)
+  midMarketRate       Decimal      @db.Decimal(14, 6)
+  clientRate          Decimal      @db.Decimal(14, 6)
+  spreadBps           Int
+  volatilityBufferBps Int
+  spreadRevenue       Decimal      @db.Decimal(18, 4)
+  rateProvider        String       @default("LEGACY_UNKNOWN") @map("rate_provider") @db.VarChar(64)
+  rateObservedAt      DateTime     @default(now()) @map("rate_observed_at")
+  state               FxQuoteState @default(ACTIVE)
+  consumedAt          DateTime?    @map("consumed_at")
+  transferId          String?      @unique @map("transfer_id") @db.Uuid
+  expiresAt           DateTime
+  createdAt           DateTime     @default(now())
+
+  corridor Corridor  @relation(fields: [corridorCode], references: [code])
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  transfer Transfer? @relation(fields: [transferId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, state, expiresAt])
+  @@index([expiresAt])
+  @@map("fx_quotes")
+}
+
+model IsoMessageAudit {
+  id            String           @id @default(uuid()) @db.Uuid
+  messageId     String           @unique @db.VarChar(64)
+  uetr          String           @db.Uuid
+  messageType   String           @db.VarChar(32) // pacs.008.001.10, pacs.002.001.12
+  status        IsoMessageStatus
+  rawXmlPayload String           @db.Text
+  transactionId String?          @db.Uuid
+  createdAt     DateTime         @default(now())
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+
+  @@index([uetr])
+  @@index([messageType])
+  @@map("iso_message_audits")
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  fullName     String    @map("full_name") @db.VarChar(128)
+  email        String    @unique @db.VarChar(255)
+  phone        String    @unique @db.VarChar(32)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  pinHash      String    @map("pin_hash") @db.VarChar(255)
+  kycStatus    KycStatus @default(NOT_SUBMITTED) @map("kyc_status")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  wallets       Wallet[]
+  beneficiaries Beneficiary[]
+  kycDocuments  KycDocument[]
+  activities    WalletActivity[]
+  transfers     Transfer[]
+  fxQuotes      FxQuote[]
+  kycReviewEvents KycReviewEvent[]
+
+  @@map("users")
+}
+
+model Wallet {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  currency        String   @db.VarChar(3)
+  balance         Decimal  @default(0) @db.Decimal(18, 4)
+  shadowAccountId String   @unique @map("shadow_account_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shadowAccount Account          @relation(fields: [shadowAccountId], references: [id], onDelete: Restrict)
+  activities    WalletActivity[]
+  transfers     Transfer[]
+
+  @@unique([userId, currency])
+  @@map("wallets")
+}
+
+model Beneficiary {
+  id                 String                        @id @default(uuid()) @db.Uuid
+  userId             String                        @map("user_id") @db.Uuid
+  fullName           String                        @map("full_name") @db.VarChar(128)
+  iban               String                        @db.VarChar(34)
+  bic                String                        @db.VarChar(11)
+  bankName           String                        @map("bank_name") @db.VarChar(128)
+  country            String                        @db.VarChar(2)
+  verificationStatus BeneficiaryVerificationStatus @default(UNVERIFIED) @map("verification_status")
+  createdAt          DateTime                      @default(now()) @map("created_at")
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transfers Transfer[]
+
+  @@index([userId])
+  @@map("beneficiaries")
+}
+
+model KycDocument {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @map("user_id") @db.Uuid
+  documentType       String   @map("document_type") @db.VarChar(32)
+  fileName           String   @map("file_name") @db.VarChar(255)
+  mimeType           String   @map("mime_type") @db.VarChar(128)
+  fileData           Bytes?   @map("file_data")
+  ciphertext         Bytes?
+  encryptionNonce    Bytes?   @map("encryption_nonce")
+  authenticationTag  Bytes?   @map("authentication_tag")
+  keyVersion         String?  @map("key_version") @db.VarChar(64)
+  wrappedDataKey     Bytes?   @map("wrapped_data_key")
+  keyWrapNonce       Bytes?   @map("key_wrap_nonce")
+  keyWrapTag         Bytes?   @map("key_wrap_tag")
+  encryptionAlgorithm String? @map("encryption_algorithm") @db.VarChar(32)
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("kyc_documents")
+}
+
+model WalletActivity {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  walletId      String   @map("wallet_id") @db.Uuid
+  transactionId String?  @map("transaction_id") @db.Uuid
+  kind          String   @db.VarChar(32)
+  status        String   @db.VarChar(32)
+  amount        Decimal  @db.Decimal(18, 4)
+  currency      String   @db.VarChar(3)
+  reference     String   @unique @db.VarChar(64)
+  description   String   @db.VarChar(255)
+  details       Json?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet      Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
+  @@map("wallet_activities")
+}
+
+model Transfer {
+  id             String         @id @default(uuid()) @db.Uuid
+  userId         String         @map("user_id") @db.Uuid
+  walletId       String         @map("wallet_id") @db.Uuid
+  beneficiaryId  String         @map("beneficiary_id") @db.Uuid
+  transactionId  String         @unique @map("transaction_id") @db.Uuid
+  uetr           String         @unique @db.Uuid
+  corridorCode   String         @map("corridor_code") @db.VarChar(16)
+  sendAmount     Decimal        @map("send_amount") @db.Decimal(18, 4)
+  feeAmount      Decimal        @map("fee_amount") @db.Decimal(18, 4)
+  sourceCurrency String         @map("source_currency") @db.VarChar(3)
+  payoutAmount   Decimal        @map("payout_amount") @db.Decimal(18, 4)
+  payoutCurrency String         @map("payout_currency") @db.VarChar(3)
+  exchangeRate   Decimal        @map("exchange_rate") @db.Decimal(14, 6)
+  status         TransferStatus @default(INITIATED)
+  purpose        String         @db.VarChar(64)
+  pacs008Xml     String         @map("pacs008_xml") @db.Text
+  pacs002Xml     String         @map("pacs002_xml") @db.Text
+  timeline       Json
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  user         User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet       Wallet                @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  beneficiary  Beneficiary           @relation(fields: [beneficiaryId], references: [id], onDelete: Restrict)
+  transaction  Transaction           @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  fxQuote      FxQuote?
+  statusEvents TransferStatusEvent[]
+
+  @@index([userId, createdAt])
+  @@map("transfers")
+}
+
+model TransferStatusEvent {
+  id            String          @id @default(uuid()) @db.Uuid
+  transferId    String          @map("transfer_id") @db.Uuid
+  sequenceOrder Int             @map("sequence_order")
+  fromStatus    TransferStatus? @map("from_status")
+  toStatus      TransferStatus  @map("to_status")
+  reason        String          @db.VarChar(255)
+  actorType     String          @default("SYSTEM") @map("actor_type") @db.VarChar(32)
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  transfer Transfer @relation(fields: [transferId], references: [id], onDelete: Restrict)
+
+  @@unique([transferId, sequenceOrder])
+  @@index([transferId, createdAt])
+  @@map("transfer_status_events")
+}
+
+model CallbackInbox {
+  id                 String                  @id @default(uuid()) @db.Uuid
+  source             CallbackSource
+  messageId          String                  @map("message_id") @db.VarChar(64)
+  originalUetr       String                  @map("original_uetr") @db.Uuid
+  transactionStatus  IsoMessageStatus        @map("transaction_status")
+  callbackTimestamp  DateTime                @map("callback_timestamp")
+  payloadHash        String                  @map("payload_hash") @db.Char(64)
+  payload            Json
+  processingStatus   CallbackProcessingStatus @default(RECEIVED) @map("processing_status")
+  processingError    String?                 @map("processing_error") @db.VarChar(255)
+  transactionId      String?                 @map("transaction_id") @db.Uuid
+  receivedAt         DateTime                @default(now()) @map("received_at")
+  processedAt        DateTime?               @map("processed_at")
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@unique([source, messageId])
+  @@index([originalUetr, receivedAt])
+  @@index([processingStatus, receivedAt])
+  @@map("callback_inbox")
+}
+
+model ReconciliationRecord {
+  id                String               @id @default(uuid()) @db.Uuid
+  source            String               @db.VarChar(64)
+  externalReference String               @map("external_reference") @db.VarChar(128)
+  externalUetr      String?              @map("external_uetr") @db.Uuid
+  transactionId     String?              @map("transaction_id") @db.Uuid
+  statementDate     DateTime             @map("statement_date")
+  amount            Decimal              @db.Decimal(18, 4)
+  currency          String               @db.VarChar(3)
+  externalStatus    String               @map("external_status") @db.VarChar(32)
+  status            ReconciliationStatus @default(UNRECONCILED)
+  details           Json?
+  createdAt         DateTime             @default(now()) @map("created_at")
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@unique([source, externalReference])
+  @@index([transactionId])
+  @@index([status, statementDate])
+  @@map("reconciliation_records")
+}
+
+model KycReviewEvent {
+  id              String         @id @default(uuid()) @db.Uuid
+  userId          String         @map("user_id") @db.Uuid
+  reviewerId      String         @map("reviewer_id") @db.VarChar(255)
+  reviewerIssuer  String         @map("reviewer_issuer") @db.VarChar(255)
+  action          KycReviewAction
+  previousStatus  KycStatus?     @map("previous_status")
+  decision        KycStatus
+  reason          String         @db.VarChar(1000)
+  correctionOfId  String?        @map("correction_of_id") @db.Uuid
+  createdAt       DateTime       @default(now()) @map("created_at")
+
+  user         User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  correctionOf KycReviewEvent? @relation("KycReviewCorrection", fields: [correctionOfId], references: [id], onDelete: Restrict)
+  corrections  KycReviewEvent[] @relation("KycReviewCorrection")
+
+  @@index([userId, createdAt])
+  @@index([reviewerIssuer, reviewerId, createdAt])
+  @@map("kyc_review_events")
+}
+
+model PartnerIdempotency {
+  id             String                  @id @default(uuid()) @db.Uuid
+  partnerId      String                  @map("partner_id") @db.VarChar(64)
+  idempotencyKey String                  @map("idempotency_key") @db.VarChar(128)
+  requestHash    String                  @map("request_hash") @db.Char(64)
+  status         PartnerIdempotencyStatus @default(PROCESSING)
+  responseStatus Int?                    @map("response_status")
+  responseBody   Json?                   @map("response_body")
+  createdAt      DateTime                @default(now()) @map("created_at")
+  updatedAt      DateTime                @updatedAt @map("updated_at")
+  expiresAt      DateTime                @map("expires_at")
+
+  @@unique([partnerId, idempotencyKey])
+  @@index([status, expiresAt])
+  @@map("partner_idempotency")
+}
+
+model TreasuryAuditEvent {
+  id          String                  @id @default(uuid()) @db.Uuid
+  eventType   TreasuryAuditEventType  @map("event_type")
+  subjectType String                  @map("subject_type") @db.VarChar(64)
+  subjectId   String                  @map("subject_id") @db.VarChar(128)
+  actorId     String                  @map("actor_id") @db.VarChar(255)
+  actorRole   String                  @map("actor_role") @db.VarChar(64)
+  details     Json?
+  createdAt   DateTime                @default(now()) @map("created_at")
+
+  @@index([eventType, createdAt])
+  @@index([subjectType, subjectId, createdAt])
+  @@map("treasury_audit_events")
+}

@@ -1,0 +1,8 @@
+node_modules/
+backend/.env
+frontend/.env.local
+frontend/.next/
+frontend-app/.env.local
+frontend-app/.next/
+frontend/out/
+coverage/

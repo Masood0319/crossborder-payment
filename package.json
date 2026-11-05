@@ -1,0 +1,33 @@
+{
+  "name": "crossborder-payment-orchestrator",
+  "version": "1.0.0",
+  "description": "Cross-border payment backend and consumer wallet workspaces",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend-app"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start:backend": "npm run start --workspace @crossborder/backend",
+    "start:consumer": "npm run dev --workspace @crossborder/consumer-app",
+    "build:backend": "npm run build --workspace @crossborder/backend",
+    "build:consumer": "npm run build --workspace @crossborder/consumer-app",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "keywords": [
+    "iso20022",
+    "pacs008",
+    "pacs002",
+    "double-entry",
+    "nostro-vostro",
+    "raast",
+    "aani",
+    "sarie",
+    "fintech"
+  ],
+  "author": "Principal FinTech Systems Architect",
+  "license": "Apache-2.0"
+}

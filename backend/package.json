@@ -1,0 +1,36 @@
+{
+  "name": "@crossborder/backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "build": "node --check src/index.js && node --check src/gateway/server.js && node --check src/gateway/consumer-routes.js",
+    "test": "node tests/run-backend-tests.js",
+    "test:postgres": "node tests/postgres-integration.js",
+    "test:security:postgres": "node tests/security-hardening-postgres.js",
+    "security:encrypt-legacy-kyc": "node scripts/encrypt-legacy-kyc-documents.js",
+    "security:rotate-kyc-keys": "node scripts/rotate-kyc-document-keys.js",
+    "security:purge-partner-idempotency": "node scripts/purge-expired-partner-idempotency.js",
+    "prisma:generate": "prisma generate --schema prisma/schema.prisma",
+    "prisma:migrate": "prisma migrate deploy --schema prisma/schema.prisma",
+    "prisma:push": "prisma db push --schema prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.16.2",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "ioredis": "^5.7.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.16.2"
+  }
+}

@@ -1,0 +1,77 @@
+// ============================================================================
+// Sanctions Watchlists Repository (JavaScript ES Modules)
+// Contains OFAC SDN, UN Consolidated, and GCC Terror lists
+// ============================================================================
+
+export const SANCTIONS_DATABASE = [
+  {
+    id: 'OFAC-SDN-10492',
+    source: 'OFAC_SDN',
+    entityType: 'INDIVIDUAL',
+    primaryName: 'Tariq Al-Hashemi',
+    aliases: ['Tariq Al Hashimi', 'Tareq Hashemi', 'Tarek El-Hashemy'],
+    citizenship: ['IQ'],
+    sanctionProgram: 'SDGT (Specially Designated Global Terrorist)',
+    remarks: 'Facilitating illicit financial transfers across GCC banks',
+  },
+  {
+    id: 'UN-CONS-8821',
+    source: 'UN_CONSOLIDATED',
+    entityType: 'INDIVIDUAL',
+    primaryName: 'Hafiz Muhammad Saeed',
+    aliases: ['Hafiz Mohammad Sayeed', 'Hafiz Saeed', 'Mohammad Sayed'],
+    citizenship: ['PK'],
+    sanctionProgram: 'UNSCR 1267/1989/2253 Committee',
+    remarks: 'Leader of proscribed entity',
+  },
+  {
+    id: 'GCC-TERR-4019',
+    source: 'GCC_TERROR_LIST',
+    entityType: 'ENTITY',
+    primaryName: 'Al-Haramain General Trading LLC',
+    aliases: ['Al Haramain Trading', 'Haramain Global Exchange', 'Al-Haramain FX'],
+    citizenship: ['AE', 'SA'],
+    sanctionProgram: 'GCC Unified Anti-Terrorism Resolution',
+    remarks: 'Front trading company operating unlicensed money remittance in UAE/KSA',
+  },
+  {
+    id: 'OFAC-SDN-99120',
+    source: 'OFAC_SDN',
+    entityType: 'INDIVIDUAL',
+    primaryName: 'Dawood Ibrahim Kaskar',
+    aliases: ['Dawood Ebrahim', 'Sheikh Dawood Hassan', 'David Kaskar', 'Dawood Sabri'],
+    citizenship: ['IN', 'PK', 'AE'],
+    sanctionProgram: 'SDGT / Foreign Narcotics Kingpin',
+    remarks: 'International financial network operative',
+  },
+  {
+    id: 'GCC-TERR-5112',
+    source: 'GCC_TERROR_LIST',
+    entityType: 'INDIVIDUAL',
+    primaryName: 'Abdullah Al-Muhaysini',
+    aliases: ['Abdullah Muhammad al Muhaysini', 'Sheikh Muhaysini'],
+    citizenship: ['SA'],
+    sanctionProgram: 'GCC Anti-Terrorism Financing Decree',
+    remarks: 'Designated terrorist financier',
+  },
+  {
+    id: 'UN-CONS-3419',
+    source: 'UN_CONSOLIDATED',
+    entityType: 'ENTITY',
+    primaryName: 'Quds Currency Exchange Bureau',
+    aliases: ['Al-Quds Money Exchange', 'Quds Hawala Services', 'Quds Forex'],
+    citizenship: ['SY', 'LB'],
+    sanctionProgram: 'UNSCR Al-Qaida & ISIL Sanctions',
+    remarks: 'Shadow banking remittance channel',
+  },
+  {
+    id: 'OFAC-SDN-13390',
+    source: 'OFAC_SDN',
+    entityType: 'INDIVIDUAL',
+    primaryName: 'Mansoor Dadullah',
+    aliases: ['Mansur Dadullah', 'Mullah Mansoor', 'Dadullah Brother'],
+    citizenship: ['AF', 'PK'],
+    sanctionProgram: 'Taliban Sanctions',
+    remarks: 'Financial courier',
+  },
+];
