@@ -8,8 +8,16 @@ import { z } from 'zod';
 import { validateBic, validateIban } from '../iso20022/validator.js';
 import { CORRIDOR_CONFIGURATIONS } from '../treasury/corridor-rates.js';
 import { TokenBucketRateLimiter } from './security.js';
-import { assertTransferTransition, transitionTransfer } from './transfer-lifecycle.js';
+import {
+  assertTransferTransition,
+  buildTransferLifecycle,
+  TRANSFER_STATUSES,
+  transitionTransfer,
+} from './transfer-lifecycle.js';
 import { makeStaffAuthMiddleware } from './staff-auth.js';
+import { MOCK_INTERBANK_RATES } from '../treasury/corridor-rates.js';
+import { PaymentRoutingEngine, listRoutingStrategies, routingInputFromCorridor } from '../routing/routing-engine.js';
+import { getSimulatedProviderAdapterSummaries } from '../routing/simulated-provider-adapters.js';
 
 const baseUsdRates = {
   PKR: new Prisma.Decimal('0.003578'),
@@ -17,6 +25,26 @@ const baseUsdRates = {
   SAR: new Prisma.Decimal('0.266667'),
   USD: new Prisma.Decimal('1'),
 };
+
+function setCustomerSessionCookie(res, token) {
+  const secure = process.env.NODE_ENV === 'production';
+  const attributes = [
+    `crossborder_customer_session=${encodeURIComponent(token)}`,
+    'HttpOnly',
+    'Path=/',
+    'SameSite=Strict',
+    'Max-Age=43200',
+  ];
+  if (secure) attributes.push('Secure');
+  res.setHeader('Set-Cookie', attributes.join('; '));
+}
+
+function clearCustomerSessionCookie(res) {
+  const secure = process.env.NODE_ENV === 'production';
+  const attributes = ['crossborder_customer_session=', 'HttpOnly', 'Path=/', 'SameSite=Strict', 'Max-Age=0'];
+  if (secure) attributes.push('Secure');
+  res.setHeader('Set-Cookie', attributes.join('; '));
+}
 
 const Decimal = Prisma.Decimal;
 const JWT_ISSUER = 'crossborder-payment-orchestrator';
@@ -52,6 +80,27 @@ const transferSchema = z.object({
   purpose: z.enum(['FAMILY_SUPPORT', 'EDUCATION', 'MEDICAL', 'SAVINGS', 'OTHER']),
   pin: z.string().regex(/^\d{6}$/),
   quoteId: z.string().uuid(),
+  routingStrategy: z.enum(['LOWEST_COST', 'FASTEST', 'BALANCED']).optional(),
+  preferredSpeed: z.enum(['FLEXIBLE', 'STANDARD', 'URGENT']).optional(),
+});
+const routingPreviewSchema = z.object({
+  sourceCountry: z.enum(['PK', 'AE', 'SA']),
+  destinationCountry: z.enum(['PK', 'AE', 'SA']),
+  sourceCurrency: z.enum(currencies),
+  destinationCurrency: z.enum(currencies),
+  amount: z.string().trim().min(1).max(32).regex(/^\d+(?:\.\d+)?$/),
+  preferredSpeed: z.enum(['FLEXIBLE', 'STANDARD', 'URGENT']).default('STANDARD'),
+  strategy: z.enum(['LOWEST_COST', 'FASTEST', 'BALANCED']).default('BALANCED'),
+  quoteId: z.string().uuid().optional(),
+});
+const beneficiaryUpdateSchema = beneficiarySchema;
+const transferListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).max(100000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(50).default(10),
+  status: z.enum(TRANSFER_STATUSES).optional(),
+  query: z.string().trim().max(100).optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
 });
 const quoteSchema = z.object({
   amount: z.number().finite().positive().max(100000000),
@@ -131,7 +180,29 @@ function makeAuthMiddleware() {
 
   return (req, res, next) => {
     const authorization = req.headers.authorization || '';
-    const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    const bearerToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    const cookieTokenRaw = req.headers.cookie
+      ?.split(';')
+      .map(value => value.trim())
+      .find(value => value.startsWith('crossborder_customer_session='))
+      ?.slice('crossborder_customer_session='.length);
+    let cookieToken = '';
+    if (cookieTokenRaw) {
+      try { cookieToken = decodeURIComponent(cookieTokenRaw); } catch { cookieToken = ''; }
+    }
+    const token = bearerToken || cookieToken || '';
+    const cookieAuthenticated = !bearerToken && Boolean(cookieToken);
+    if (cookieAuthenticated
+      && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
+      && req.headers.origin) {
+      const allowedOrigins = new Set([
+        process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
+        process.env.CONSUMER_FRONTEND_ORIGIN || 'http://localhost:3001',
+      ]);
+      if (!allowedOrigins.has(req.headers.origin)) {
+        return res.status(403).json({ error: 'Invalid request origin' });
+      }
+    }
     if (!token) return res.status(401).json({ error: 'Authentication required' });
 
     try {
@@ -308,12 +379,34 @@ export function createConsumerRouter({
   orchestrator,
   kycEncryption = null,
   staffTokenVerifier,
+  routingEngine = new PaymentRoutingEngine(),
 }) {
   const router = express.Router();
   const authenticate = makeAuthMiddleware();
+  const auditKycAccess = async (req, action, outcome, reason = null, documentId = null, userId = null) => {
+    if (!prisma.treasuryAuditEvent?.create) return;
+    await prisma.treasuryAuditEvent.create({
+      data: {
+        eventType: 'TREASURY_ACCESS',
+        subjectType: 'KYC_DOCUMENT',
+        subjectId: documentId || userId || 'unknown',
+        actorId: req.staffIdentity?.reviewerId || 'unauthenticated',
+        actorRole: req.staffIdentity?.roles?.sort().join(',') || 'none',
+        details: {
+          action,
+          outcome,
+          reason,
+          requestCorrelationId: req.correlationId || null,
+          userId,
+          documentId,
+        },
+      },
+    });
+  };
   const authenticateKycStaff = makeStaffAuthMiddleware(
     ['KYC_REVIEWER', 'KYC_ADMIN'],
-    staffTokenVerifier
+    staffTokenVerifier,
+    { auditDenied: req => auditKycAccess(req, 'VIEW', 'DENIED', 'KYC staff authentication or authorization failed') }
   );
   const authenticateKycReviewer = makeStaffAuthMiddleware(['KYC_REVIEWER'], staffTokenVerifier);
   const authenticateKycAdmin = makeStaffAuthMiddleware(['KYC_ADMIN'], staffTokenVerifier);
@@ -358,8 +451,8 @@ export function createConsumerRouter({
       audience: JWT_AUDIENCE,
       algorithm: 'HS256',
     });
+    setCustomerSessionCookie(res, token);
     return res.status(201).json({
-      token,
       user: { id: user.id, fullName: user.fullName, email: user.email, phone: user.phone, kycStatus: user.kycStatus },
     });
   }));
@@ -383,11 +476,25 @@ export function createConsumerRouter({
       audience: JWT_AUDIENCE,
       algorithm: 'HS256',
     });
+    setCustomerSessionCookie(res, token);
     return res.json({
-      token,
       user: { id: user.id, fullName: user.fullName, email: user.email, phone: user.phone, kycStatus: user.kycStatus },
     });
   }));
+
+  router.get('/auth/session', authenticate, asyncRoute(async (req, res) => {
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth.userId },
+      select: { id: true, fullName: true, email: true, phone: true, kycStatus: true },
+    });
+    if (!user) return res.status(401).json({ error: 'Session is no longer valid' });
+    return res.json({ user });
+  }));
+
+  router.post('/auth/logout', authenticate, (_req, res) => {
+    clearCustomerSessionCookie(res);
+    return res.json({ loggedOut: true });
+  });
 
   router.post('/auth/kyc', authenticate, upload.single('document'), asyncRoute(async (req, res) => {
     if (!kycUploadRateLimiter.consume(`kyc:${req.auth.userId}`)) {
@@ -444,6 +551,7 @@ export function createConsumerRouter({
         id: true,
         fullName: true,
         email: true,
+        updatedAt: true,
         kycDocuments: {
           orderBy: { createdAt: 'desc' },
           select: { id: true, documentType: true, fileName: true, createdAt: true },
@@ -489,6 +597,7 @@ export function createConsumerRouter({
     });
     if (result.notFound) return res.status(404).json({ error: 'KYC applicant not found' });
     if (result.conflict) return res.status(409).json({ error: 'Only a pending KYC application can be reviewed' });
+    await auditKycAccess(req, body.data.status === 'APPROVED' ? 'APPROVE' : 'REJECT', 'ALLOWED', body.data.reason, null, userId.data);
     return res.json(result);
   }));
 
@@ -536,10 +645,11 @@ export function createConsumerRouter({
     if (result.conflict) {
       return res.status(409).json({ error: 'A correction requires a prior final decision and a different status' });
     }
+    await auditKycAccess(req, 'CORRECT', 'ALLOWED', body.data.reason, null, userId.data);
     return res.json(result);
   }));
 
-  router.get('/admin/kyc/:userId/reviews', authenticateKycAdmin, asyncRoute(async (req, res) => {
+  router.get('/admin/kyc/:userId/reviews', authenticateKycStaff, asyncRoute(async (req, res) => {
     const userId = z.string().uuid().safeParse(req.params.userId);
     if (!userId.success) return res.status(400).json({ error: 'userId must be a UUID' });
     const reviews = await prisma.kycReviewEvent.findMany({
@@ -553,6 +663,7 @@ export function createConsumerRouter({
     const userId = z.string().uuid().safeParse(req.params.userId);
     const documentId = z.string().uuid().safeParse(req.params.documentId);
     if (!userId.success || !documentId.success) {
+      await auditKycAccess(req, 'VIEW', 'DENIED', 'Invalid document or user identifier', documentId.success ? documentId.data : null, userId.success ? userId.data : null);
       return res.status(400).json({ error: 'userId and documentId must be UUIDs' });
     }
     const document = await prisma.kycDocument.findFirst({
@@ -574,20 +685,27 @@ export function createConsumerRouter({
         createdAt: true,
       },
     });
-    if (!document) return res.status(404).json({ error: 'KYC document not found' });
+    if (!document) {
+      await auditKycAccess(req, 'VIEW', 'DENIED', 'KYC document not found', documentId.data, userId.data);
+      return res.status(404).json({ error: 'KYC document not found' });
+    }
     if (document.fileData || !document.ciphertext) {
+      await auditKycAccess(req, 'DOWNLOAD', 'DENIED', 'Legacy KYC document is not encrypted for retrieval', documentId.data, userId.data);
       return res.status(409).json({ error: 'Legacy KYC document requires the explicit encryption migration before retrieval' });
     }
     if (!kycEncryption) {
+      await auditKycAccess(req, 'DOWNLOAD', 'DENIED', 'KYC decryption is not configured', documentId.data, userId.data);
       return res.status(503).json({ error: 'KYC document decryption is not configured' });
     }
     let decrypted;
     try {
       decrypted = kycEncryption.decrypt(document);
     } catch {
+      await auditKycAccess(req, 'DOWNLOAD', 'DENIED', 'KYC document decryption failed', documentId.data, userId.data);
       console.error('[KYC_DOCUMENT_DECRYPTION_ERROR] Authenticated document decryption failed');
       return res.status(500).json({ error: 'KYC document could not be decrypted' });
     }
+    await auditKycAccess(req, 'DOWNLOAD', 'ALLOWED', null, documentId.data, userId.data);
     res.type(document.mimeType);
     res.set('X-Content-Type-Options', 'nosniff');
     res.attachment(document.fileName);
@@ -820,6 +938,88 @@ export function createConsumerRouter({
     return res.json({ beneficiaries });
   }));
 
+  router.get('/transfers', authenticate, asyncRoute(async (req, res) => {
+    const parsed = transferListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid transfer filters or pagination values' });
+    }
+
+    const { page, pageSize, status, query, from, to } = parsed.data;
+    const searchConditions = query
+      ? [{ beneficiary: { fullName: { contains: query, mode: 'insensitive' } } }]
+      : [];
+    if (query && z.string().uuid().safeParse(query).success) {
+      searchConditions.push({ uetr: query });
+    }
+    const where = {
+      userId: req.auth.userId,
+      ...(status ? { status } : {}),
+      ...(searchConditions.length ? { OR: searchConditions } : {}),
+      ...((from || to) ? {
+        createdAt: {
+          ...(from ? { gte: new Date(from) } : {}),
+          ...(to ? { lte: new Date(to) } : {}),
+        },
+      } : {}),
+    };
+    const [transfers, total, statusSummary, amountSummary] = await Promise.all([
+      prisma.transfer.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          uetr: true,
+          sendAmount: true,
+          feeAmount: true,
+          sourceCurrency: true,
+          payoutAmount: true,
+          payoutCurrency: true,
+          exchangeRate: true,
+          status: true,
+          purpose: true,
+          createdAt: true,
+          beneficiary: {
+            select: { fullName: true, bankName: true, country: true },
+          },
+        },
+      }),
+      prisma.transfer.count({ where }),
+      prisma.transfer.groupBy({
+        by: ['status'],
+        where: { userId: req.auth.userId },
+        _count: { _all: true },
+      }),
+      prisma.transfer.groupBy({
+        by: ['sourceCurrency'],
+        where: { userId: req.auth.userId },
+        _sum: { sendAmount: true, feeAmount: true },
+        _count: { _all: true },
+      }),
+    ]);
+
+    return res.json({
+      transfers,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+      },
+      summary: {
+        byStatus: statusSummary.map(item => ({ status: item.status, count: item._count._all })),
+        byCurrency: amountSummary.map(item => ({
+          currency: item.sourceCurrency,
+          count: item._count._all,
+          sendAmount: item._sum.sendAmount,
+          feeAmount: item._sum.feeAmount,
+        })),
+        isFiltered: Boolean(status || query || from || to),
+      },
+    });
+  }));
+
   router.get('/transfers/:transferId', authenticate, asyncRoute(async (req, res) => {
     const transferId = z.string().uuid().safeParse(req.params.transferId);
     if (!transferId.success) return res.status(400).json({ error: 'transferId must be a UUID' });
@@ -831,7 +1031,82 @@ export function createConsumerRouter({
       },
     });
     if (!transfer) return res.status(404).json({ error: 'Transfer not found' });
-    return res.json({ transfer });
+    return res.json({
+      transfer,
+      lifecycle: buildTransferLifecycle(transfer),
+    });
+  }));
+
+  router.get('/routing/strategies', authenticate, (_req, res) => {
+    return res.json({
+      strategies: listRoutingStrategies(),
+      preferences: ['FLEXIBLE', 'STANDARD', 'URGENT'],
+      providers: getSimulatedProviderAdapterSummaries(),
+      executionMode: 'SIMULATED',
+    });
+  });
+
+  router.post('/routing/preview', authenticate, asyncRoute(async (req, res) => {
+    const parsed = routingPreviewSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid routing preview input' });
+    const { quoteId, ...input } = parsed.data;
+    let exchangeRate;
+    let rateSource = 'STATIC_DEMO';
+    if (quoteId) {
+      const quote = await prisma.fxQuote.findFirst({
+        where: { quoteId, userId: req.auth.userId },
+        select: { quoteId: true, corridorCode: true, sourceCurrency: true, targetCurrency: true, instructedAmount: true, clientRate: true, state: true, expiresAt: true },
+      });
+      if (!quote) return res.status(404).json({ error: 'FX quote not found for this customer' });
+      if (quote.state !== 'ACTIVE' || quote.expiresAt <= new Date()) {
+        return res.status(409).json({ error: 'FX quote is expired or unavailable' });
+      }
+      const expected = routingInputFromCorridor(
+        quote.corridorCode,
+        input.amount,
+        input.strategy,
+        input.preferredSpeed,
+        quote.clientRate.toString()
+      );
+      if (expected.sourceCountry !== input.sourceCountry
+        || expected.destinationCountry !== input.destinationCountry
+        || quote.sourceCurrency !== input.sourceCurrency
+        || quote.targetCurrency !== input.destinationCurrency
+        || !quote.instructedAmount.equals(input.amount)) {
+        return res.status(400).json({ error: 'FX quote does not match the routing preview details' });
+      }
+      exchangeRate = quote.clientRate.toString();
+      rateSource = quote.rateProvider || 'PERSISTED_QUOTE';
+    } else {
+      const pair = `${input.sourceCurrency}/${input.destinationCurrency}`;
+      const feed = MOCK_INTERBANK_RATES[pair];
+      exchangeRate = feed ? feed.midMarketRate.toString() : undefined;
+    }
+
+    try {
+      const comparison = routingEngine.compare({
+        ...input,
+        exchangeRate,
+      });
+      return res.json({ ...comparison, rateSource, estimatedOnly: true });
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }));
+
+  router.get('/transfers/:transferId/routing', authenticate, asyncRoute(async (req, res) => {
+    const transferId = z.string().uuid().safeParse(req.params.transferId);
+    if (!transferId.success) return res.status(400).json({ error: 'transferId must be a UUID' });
+    const transfer = await prisma.transfer.findFirst({
+      where: { id: transferId.data, userId: req.auth.userId },
+      select: { id: true, timeline: true },
+    });
+    if (!transfer) return res.status(404).json({ error: 'Transfer not found' });
+    const event = Array.isArray(transfer.timeline)
+      ? transfer.timeline.find(item => item?.step === 'ROUTE_SELECTED')
+      : null;
+    if (!event?.routingDecision) return res.status(404).json({ error: 'Routing decision is unavailable for this transfer' });
+    return res.json({ routingDecision: event.routingDecision, executionMode: 'SIMULATED' });
   }));
 
   router.post('/fx/quote', authenticate, asyncRoute(async (req, res) => {
@@ -970,6 +1245,90 @@ export function createConsumerRouter({
     return res.status(201).json({ beneficiary });
   }));
 
+  router.put('/beneficiaries/:beneficiaryId', authenticate, asyncRoute(async (req, res) => {
+    const beneficiaryId = z.string().uuid().safeParse(req.params.beneficiaryId);
+    const parsed = beneficiaryUpdateSchema.safeParse(req.body);
+    if (!beneficiaryId.success || !parsed.success) {
+      return res.status(400).json({ error: 'A valid beneficiary ID and beneficiary details are required' });
+    }
+
+    const iban = parsed.data.iban.replace(/[\s-]/g, '').toUpperCase();
+    const bic = parsed.data.bic.trim().toUpperCase();
+    const ibanCheck = validateIban(iban);
+    if (!ibanCheck.isValid || ibanCheck.countryCode !== parsed.data.country) {
+      return res.status(400).json({ error: ibanCheck.error || 'IBAN country does not match beneficiary country' });
+    }
+    const bicCheck = validateBic(bic);
+    if (!bicCheck.isValid) return res.status(400).json({ error: bicCheck.error });
+
+    let outcome;
+    try {
+      outcome = await prisma.$transaction(async tx => {
+        const existing = await tx.beneficiary.findFirst({
+          where: { id: beneficiaryId.data, userId: req.auth.userId },
+          select: { id: true },
+        });
+        if (!existing) return { notFound: true };
+        const used = await tx.transfer.findFirst({
+          where: { beneficiaryId: beneficiaryId.data, userId: req.auth.userId },
+          select: { id: true },
+        });
+        if (used) return { conflict: true };
+
+        const beneficiary = await tx.beneficiary.update({
+          where: { id: beneficiaryId.data },
+          data: { ...parsed.data, iban, bic, verificationStatus: 'FORMAT_VALIDATED' },
+        });
+        return { beneficiary };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (error?.code === 'P2034') {
+        return res.status(409).json({ error: 'Beneficiary transfer history changed; refresh and try again' });
+      }
+      throw error;
+    }
+    if (outcome.notFound) return res.status(404).json({ error: 'Beneficiary not found' });
+    if (outcome.conflict) {
+      return res.status(409).json({ error: 'Beneficiary details cannot be edited after they have been used in a transfer' });
+    }
+    return res.json({ beneficiary: outcome.beneficiary });
+  }));
+
+  router.delete('/beneficiaries/:beneficiaryId', authenticate, asyncRoute(async (req, res) => {
+    const beneficiaryId = z.string().uuid().safeParse(req.params.beneficiaryId);
+    if (!beneficiaryId.success) return res.status(400).json({ error: 'A valid beneficiary ID is required' });
+
+    let outcome;
+    try {
+      outcome = await prisma.$transaction(async tx => {
+        const existing = await tx.beneficiary.findFirst({
+          where: { id: beneficiaryId.data, userId: req.auth.userId },
+          select: { id: true },
+        });
+        if (!existing) return { notFound: true };
+        const used = await tx.transfer.findFirst({
+          where: { beneficiaryId: beneficiaryId.data, userId: req.auth.userId },
+          select: { id: true },
+        });
+        if (used) return { conflict: true };
+
+        await tx.beneficiary.delete({ where: { id: beneficiaryId.data } });
+        return { deleted: true };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (error?.code === 'P2003' || error?.code === 'P2034') {
+        return res.status(409).json({ error: 'Beneficiary could not be removed because transfer history changed; refresh and try again' });
+      }
+      throw error;
+    }
+
+    if (outcome.notFound) return res.status(404).json({ error: 'Beneficiary not found' });
+    if (outcome.conflict) {
+      return res.status(409).json({ error: 'Beneficiaries with transfer history cannot be deleted' });
+    }
+    return res.status(204).end();
+  }));
+
   router.post('/transfers/send', authenticate, asyncRoute(async (req, res) => {
     const parsed = validateBody(transferSchema, req.body);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
@@ -1052,6 +1411,24 @@ export function createConsumerRouter({
       || quote.sourceCurrency !== sourceCurrency
       || quote.targetCurrency !== targetCurrency) {
       return res.status(400).json({ error: 'FX quote does not match the transfer details' });
+    }
+    let routingDecision;
+    try {
+      routingDecision = routingEngine.route(routingInputFromCorridor(
+        corridorCode,
+        requestedAmount.toString(),
+        parsed.data.routingStrategy || 'BALANCED',
+        parsed.data.preferredSpeed || 'STANDARD',
+        quote.clientRate.toString()
+      ));
+    } catch (error) {
+      if (error.code === 'NO_ELIGIBLE_ROUTES') {
+        return res.status(409).json({
+          error: 'No eligible simulated payment route is available',
+          routingComparison: error.comparison,
+        });
+      }
+      throw error;
     }
 
     let payment;
@@ -1237,8 +1614,15 @@ export function createConsumerRouter({
         legs: fxEntries,
       });
       const timeline = [
-        { step: 'WALLET_DEBITED', label: 'Wallet debit posted', status: 'COMPLETED', completedAt: new Date().toISOString() },
+        {
+          step: 'ROUTE_SELECTED',
+          label: 'Simulated provider route selected',
+          status: 'ESTIMATED',
+          completedAt: new Date().toISOString(),
+          routingDecision,
+        },
         { step: 'SANCTIONS_CLEARED', label: 'Sanctions cleared', status: 'COMPLETED', completedAt: new Date().toISOString() },
+        { step: 'WALLET_DEBITED', label: 'Wallet debit posted', status: 'COMPLETED', completedAt: new Date().toISOString() },
         { step: 'INSTRUCTION_CREATED', label: 'Payment instruction prepared', status: 'COMPLETED', completedAt: new Date().toISOString() },
         { step: 'FUNDS_RECEIVED', label: 'External settlement', status: 'PENDING' },
       ];
@@ -1325,6 +1709,7 @@ export function createConsumerRouter({
     }
     return res.status(201).json({
       transfer,
+      routingDecision,
       feeAmount,
       feeCurrency: sourceCurrency,
       totalDebited: debitAmount,

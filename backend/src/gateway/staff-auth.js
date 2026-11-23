@@ -39,34 +39,40 @@ export function verifyStaffSession(token, environment = process.env) {
   };
 }
 
-export function makeStaffAuthMiddleware(requiredRoles, verifier = verifyStaffSession) {
+export function makeStaffAuthMiddleware(requiredRoles, verifier = verifyStaffSession, options = {}) {
   if (!Array.isArray(requiredRoles) || requiredRoles.length === 0) {
     throw new Error('At least one required staff role must be specified');
   }
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const authorization = req.headers.authorization || '';
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-    if (!token) return res.status(401).json({ error: 'Authenticated staff session required' });
+    if (!token) {
+      if (options.auditDenied) await options.auditDenied(req, 'missing staff session');
+      return res.status(401).json({ error: 'Authenticated staff session required' });
+    }
 
     let identity;
     try {
       identity = verifier(token);
     } catch (error) {
       if (error instanceof StaffAuthenticationUnavailableError) {
+        if (options.auditDenied) await options.auditDenied(req, 'staff authentication unavailable');
         return res.status(503).json({ error: 'Staff authentication is not configured' });
       }
+      if (options.auditDenied) await options.auditDenied(req, 'invalid or expired staff session');
       return res.status(401).json({ error: 'Invalid or expired staff session' });
     }
 
     if (!identity || typeof identity.reviewerId !== 'string'
       || typeof identity.issuer !== 'string' || !Array.isArray(identity.roles)) {
+      if (options.auditDenied) await options.auditDenied(req, 'invalid staff identity claims');
       return res.status(401).json({ error: 'Invalid staff identity claims' });
     }
+    req.staffIdentity = identity;
     if (!requiredRoles.some(role => identity.roles.includes(role))) {
+      if (options.auditDenied) await options.auditDenied(req, 'staff role is not authorized');
       return res.status(403).json({ error: 'Staff role is not authorized for this operation' });
     }
-
-    req.staffIdentity = identity;
     return next();
   };
 }

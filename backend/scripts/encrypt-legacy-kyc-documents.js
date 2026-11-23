@@ -1,6 +1,8 @@
-import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import { createKycDocumentEncryptionService } from '../src/gateway/kyc-encryption.js';
+import { loadBackendEnvironment } from '../src/gateway/environment.js';
+
+loadBackendEnvironment();
 
 if (process.env.CONFIRM_KYC_LEGACY_ENCRYPTION !== 'YES') {
   throw new Error('Set CONFIRM_KYC_LEGACY_ENCRYPTION=YES after taking and verifying a protected backup');

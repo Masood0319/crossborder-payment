@@ -6,3 +6,7 @@ frontend-app/.env.local
 frontend-app/.next/
 frontend/out/
 coverage/
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.local.example

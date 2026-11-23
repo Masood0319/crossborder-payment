@@ -1,6 +1,8 @@
-import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import { createKycDocumentEncryptionService } from '../src/gateway/kyc-encryption.js';
+import { loadBackendEnvironment } from '../src/gateway/environment.js';
+
+loadBackendEnvironment();
 
 const prisma = new PrismaClient();
 const encryption = createKycDocumentEncryptionService();

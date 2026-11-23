@@ -6,7 +6,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Brand } from '../components/PublicSite.jsx';
 import {
-  acknowledgeTreasuryAlert, clearStaffSession, getStaffSession, getTreasuryLiquidityAlerts,
+  acknowledgeTreasuryAlert, clearStaffSession, getActiveFxQuotes, getOperationsSummary, getStaffSession, getTreasuryLiquidityAlerts,
 } from '../services/api.js';
 
 const viewerRoles = ['TREASURY_VIEWER', 'TREASURY_OPERATOR', 'TREASURY_ADMIN'];
@@ -18,6 +18,9 @@ export default function TreasuryPage() {
   const [balances, setBalances] = useState([]);
   const [corridors, setCorridors] = useState([]);
   const [alerts, setAlerts] = useState([]);
+  const [quotes, setQuotes] = useState([]);
+  const [exposure, setExposure] = useState([]);
+  const [treasuryActivity, setTreasuryActivity] = useState([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -33,10 +36,17 @@ export default function TreasuryPage() {
     setRefreshing(true);
     setError('');
     try {
-      const result = await getTreasuryLiquidityAlerts();
+      const [result, quoteResult, operationsResult] = await Promise.all([
+        getTreasuryLiquidityAlerts(),
+        getActiveFxQuotes(),
+        getOperationsSummary(),
+      ]);
       setAlerts(result.alerts || []);
       setBalances(result.balances || []);
       setCorridors(result.corridors || []);
+      setQuotes(quoteResult.quotes || []);
+      setExposure(operationsResult.currencyStatistics || []);
+      setTreasuryActivity(operationsResult.recentTreasuryActivity || []);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -111,7 +121,8 @@ export default function TreasuryPage() {
         <header className="border-b border-slate-200 bg-white">
           <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-5 py-4 sm:px-8">
             <div className="flex items-center gap-4"><Brand /><span className="hidden h-7 border-l border-slate-200 sm:block" /><span className="hidden text-sm font-bold text-slate-500 sm:block">Treasury operations</span></div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 sm:gap-3">
+              <Link href="/operations" className="rounded-xl border border-slate-200 px-3 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50">Transfer operations</Link>
               <span className="hidden text-right sm:block"><span className="block text-xs font-bold text-ink">{staffName}</span><span className="block text-[10px] font-semibold text-slate-500">{roles.filter(role => viewerRoles.includes(role)).join(' · ')}</span></span>
               <button type="button" onClick={signOut} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50"><LogOut size={15} />Sign out</button>
             </div>
@@ -143,6 +154,44 @@ export default function TreasuryPage() {
                 <SummaryCard icon={Landmark} label="Configured pools" value={balances.length} detail="Nostro balance records" />
                 <SummaryCard icon={CircleAlert} label="Open liquidity alerts" value={activeAlerts.length} detail="Based on current configured thresholds" tone={activeAlerts.length ? 'amber' : 'green'} />
                 <SummaryCard icon={CircleCheck} label="Acknowledged this view" value={alerts.length - activeAlerts.length} detail="Audit record only; no funds moved" tone="blue" />
+              </section>
+
+              <section className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
+                <div className="flex flex-col justify-between gap-2 border-b border-slate-100 px-5 py-4 sm:flex-row sm:items-center sm:px-6">
+                  <div><h2 className="text-base font-extrabold text-ink">Available FX quotes</h2><p className="mt-1 text-xs text-slate-500">Unexpired persisted quotes; records are informational, and provider labels describe their source.</p></div>
+                  <span className="w-fit rounded-full bg-blue-50 px-3 py-1 text-[10px] font-extrabold text-blue-800">{quotes.length} active quotes</span>
+                </div>
+                {quotes.length ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[840px] text-left text-xs">
+                      <thead className="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="px-5 py-3">Pair / corridor</th><th className="px-4 py-3 text-right">Amount</th><th className="px-4 py-3 text-right">Payout</th><th className="px-4 py-3 text-right">Mid / client rate</th><th className="px-4 py-3 text-right">Spread</th><th className="px-5 py-3">Source / expiry</th></tr></thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {quotes.map(quote => (
+                          <tr key={quote.quoteId}>
+                            <td className="px-5 py-4"><span className="block font-bold text-ink">{quote.sourceCurrency}/{quote.targetCurrency}</span><span className="mt-1 block text-[10px] text-slate-500">{quote.corridorCode}</span></td>
+                            <td className="px-4 py-4 text-right tabular-nums text-slate-700">{formatAmount(quote.instructedAmount)} {quote.sourceCurrency}</td>
+                            <td className="px-4 py-4 text-right tabular-nums font-bold text-ink">{formatAmount(quote.settlementAmount)} {quote.targetCurrency}</td>
+                            <td className="px-4 py-4 text-right font-mono tabular-nums text-slate-700">{formatRate(quote.midMarketRate)} / {formatRate(quote.clientRate)}</td>
+                            <td className="px-4 py-4 text-right text-slate-700">{quote.spreadBps} bps + {quote.volatilityBufferBps} bps<br /><span className="text-[10px] text-slate-500">spread {formatAmount(quote.spreadRevenue)} {quote.sourceCurrency}</span></td>
+                            <td className="px-5 py-4"><span className={`rounded-full px-2 py-1 text-[9px] font-extrabold ${quote.rateProvider === 'STATIC_DEMO' ? 'bg-amber-50 text-amber-900' : 'bg-slate-100 text-slate-700'}`}>{quote.rateProvider}</span><span className="mt-2 block text-[10px] text-slate-500">Expires {new Date(quote.expiresAt).toLocaleString()}</span></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : <EmptyState title="No active quotes" detail="No persisted quote is currently within its expiry window." />}
+                <p className="border-t border-slate-100 px-5 py-3 text-[10px] leading-4 text-slate-500">Quote rows are persisted application records. Static/demo providers are not live market rates; no real liquidity is created by a quote.</p>
+              </section>
+
+              <section className="grid gap-5 lg:grid-cols-2">
+                <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
+                  <div className="border-b border-slate-100 px-5 py-4"><h2 className="text-base font-extrabold text-ink">Transfer volume by source currency</h2><p className="mt-1 text-xs text-slate-500">Persisted transfer amounts grouped by currency; currencies are not added together.</p></div>
+                  {exposure.length ? <ul className="divide-y divide-slate-100">{exposure.map(row => <li key={row.sourceCurrency} className="flex items-center justify-between gap-4 px-5 py-4 text-sm"><div><p className="font-bold text-ink">{row.sourceCurrency}</p><p className="mt-1 text-xs text-slate-500">{row.count} transfers · fees {formatAmount(row.feeAmount)}</p></div><p className="font-mono text-xs font-bold text-slate-700">{formatAmount(row.sendAmount)}</p></li>)}</ul> : <EmptyState title="No currency exposure data" detail="No persisted transfer amounts are available." />}
+                </div>
+                <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
+                  <div className="border-b border-slate-100 px-5 py-4"><h2 className="text-base font-extrabold text-ink">Recent treasury audit activity</h2><p className="mt-1 text-xs text-slate-500">Staff access and alert actions from the existing audit log.</p></div>
+                  {treasuryActivity.length ? <ul className="divide-y divide-slate-100">{treasuryActivity.map(event => <li key={event.id} className="px-5 py-3 text-xs"><p className="font-bold text-ink">{event.type.replaceAll('_', ' ')} · {event.subjectType.replaceAll('_', ' ')}</p><p className="mt-1 break-all font-mono text-[10px] text-slate-500">{event.subjectId}</p><p className="mt-1 text-[10px] text-slate-400">{event.actorRole} · {new Date(event.createdAt).toLocaleString()}</p></li>)}</ul> : <EmptyState title="No treasury activity" detail="No treasury audit events have been recorded." />}
+                </div>
               </section>
 
               <section className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
@@ -247,14 +296,15 @@ function EmptyState({ title, detail }) {
 }
 
 function formatAmount(value, currency) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return `${value} ${currency}`;
-  return new Intl.NumberFormat('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount);
+  const [whole = '0', fraction] = String(value ?? '0').split('.');
+  const amount = `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${fraction ? `.${fraction}` : ''}`;
+  return currency ? `${amount} ${currency}` : amount;
 }
 
 function formatRate(value) {
-  const rate = Number(value);
-  return Number.isFinite(rate) ? rate.toFixed(6) : '';
+  if (value === null || value === undefined || value === '') return '';
+  const [whole = '0', fraction = ''] = String(value).split('.');
+  return `${whole}.${fraction.padEnd(6, '0').slice(0, 6)}`;
 }
 
 function Loading() {

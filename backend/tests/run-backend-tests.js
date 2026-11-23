@@ -734,6 +734,15 @@ async function runTestSuite() {
     { prisma: callbackPrisma, hmacSecret: testSecret, source: 'SIMULATED' }
   );
   assert(callbackResult.statusCode === 200 && callbackResult.body.duplicate === true, 'Duplicate callback delivery is idempotent');
+  await handleBankCallback(
+    {
+      ...callbackRequest,
+      headers: { ...callbackRequest.headers, 'x-signature': 'invalid-signature' },
+    },
+    callbackResponse,
+    { prisma: callbackPrisma, hmacSecret: testSecret, source: 'SIMULATED' }
+  );
+  assert(callbackResult.statusCode === 401, 'Callback receiver rejects an invalid HMAC signature');
 
   const orchestrator = new PaymentOrchestrator();
   const paymentRequest = {

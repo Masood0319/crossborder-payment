@@ -1,5 +1,7 @@
-import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
+import { loadBackendEnvironment } from '../src/gateway/environment.js';
+
+loadBackendEnvironment();
 
 const prisma = new PrismaClient();
 

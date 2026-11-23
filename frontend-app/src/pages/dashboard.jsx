@@ -5,7 +5,7 @@ import { useRouter } from 'next/router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConsumerLayout } from '../components/ConsumerLayout.jsx';
 import { useConsumerSession } from '../components/useConsumerSession.js';
-import { getWallet, topUpWallet } from '../services/api.js';
+import { getTransfers, getWallet, topUpWallet } from '../services/api.js';
 
 const currencyFormat = (value, currency) => new Intl.NumberFormat('en-PK', {
   style: 'currency',
@@ -17,6 +17,7 @@ export default function DashboardPage() {
   const router = useRouter();
   const { session, ready } = useConsumerSession();
   const [walletData, setWalletData] = useState(null);
+  const [transferData, setTransferData] = useState(null);
   const [error, setError] = useState('');
   const [topUpAmount, setTopUpAmount] = useState('5000');
   const [topUpBusy, setTopUpBusy] = useState(false);
@@ -24,14 +25,24 @@ export default function DashboardPage() {
   const topUpIdempotencyKey = useRef(null);
 
   const refreshWallet = useCallback(async () => {
-    try {
-      setWalletData(await getWallet());
-      setError('');
-    } catch (requestError) {
-      setError(requestError.message);
-    } finally {
-      setLoading(false);
+    const [walletResult, transfersResult] = await Promise.allSettled([
+      getWallet(),
+      getTransfers({ page: 1, pageSize: 5 }),
+    ]);
+    if (walletResult.status === 'fulfilled') {
+      setWalletData(walletResult.value);
     }
+    if (transfersResult.status === 'fulfilled') {
+      setTransferData(transfersResult.value);
+    }
+    if (walletResult.status === 'rejected' || transfersResult.status === 'rejected') {
+      setError(walletResult.status === 'rejected'
+        ? walletResult.reason.message
+        : transfersResult.reason.message);
+    } else {
+      setError('');
+    }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -97,11 +108,18 @@ export default function DashboardPage() {
           <section className="grid gap-4 sm:grid-cols-3">
             <InfoCard icon={ShieldCheck} title="Identity check" value={walletData?.kycStatus || session.user.kycStatus || 'NOT_SUBMITTED'} detail={walletData?.kycStatus === 'APPROVED' ? 'You’re ready to send' : 'Verify to unlock transfers'} tone={walletData?.kycStatus === 'APPROVED' ? 'green' : 'amber'} href="/kyc" />
             <InfoCard icon={Globe2} title="Sending to" value="UAE & Saudi Arabia" detail="Clear rates before you send" tone="blue" href="/send" />
-            <InfoCard icon={Clock3} title="Transfer tracking" value="Demo status timeline" detail="No bank submission or settlement is verified" tone="purple" href="/dashboard#activity" />
+            <InfoCard icon={Clock3} title="Transfer tracking" value="Demo status timeline" detail="No bank submission or settlement is verified" tone="purple" href="/transfers" />
+          </section>
+
+          <section aria-label="Transfer summary" className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <SummaryCard title="Recorded transfers" value={String(transferData?.pagination?.total ?? '—')} detail="All recorded demo transfers" />
+            <SummaryCard title="In progress" value={String(countStatuses(transferData, ['INITIATED', 'VALIDATING', 'QUOTED', 'FUNDS_DEBITED', 'SUBMITTED', 'ACCEPTED']))} detail="Not yet at a terminal state" />
+            <SummaryCard title="Simulated" value={String(countStatuses(transferData, ['SIMULATED']))} detail="No bank submission or settlement" />
+            <SummaryCard title="Simulated volume" value={transferData?.summary?.byCurrency?.map(item => `${item.sendAmount ?? '0'} ${item.currency}`).join(' · ') || '—'} detail="Source amount across recorded transfers" />
           </section>
 
           <section id="activity" className="overflow-hidden rounded-3xl bg-white shadow-card ring-1 ring-slate-200">
-            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-5 sm:px-7"><div><h2 className="text-lg font-extrabold text-ink">Recent activity</h2><p className="mt-1 text-xs text-slate-500">Your latest wallet top ups and transfers</p></div><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">{activities.length} recent</span></div>
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-5 sm:px-7"><div><h2 className="text-lg font-extrabold text-ink">Recent activity</h2><p className="mt-1 text-xs text-slate-500">Your latest wallet top ups and transfers</p></div><div className="flex items-center gap-3"><Link href="/transfers" className="text-xs font-extrabold text-emerald-800 hover:underline">All transfers</Link><span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">{activities.length} recent</span></div></div>
             {activities.length ? <div className="divide-y divide-slate-100">{activities.map(activity => <ActivityRow key={activity.id} activity={activity} />)}</div> : <div className="px-6 py-12 text-center"><span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-slate-100 text-slate-500"><ArrowDownLeft size={21} /></span><h3 className="mt-4 font-bold text-ink">Your wallet is ready</h3><p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">Add money to your wallet and your recent activity will show up here.</p><a href="#top-up" className="mt-5 inline-flex items-center gap-2 rounded-xl bg-ink px-4 py-2.5 text-sm font-bold text-white">Make a top up<ArrowRight size={15} /></a></div>}
           </section>
           <p className="flex items-center justify-center gap-2 text-center text-xs text-slate-400"><ShieldCheck size={14} />Your wallet activity is protected and recorded to your personal ledger.</p>
@@ -109,6 +127,20 @@ export default function DashboardPage() {
       </ConsumerLayout>
     </>
   );
+}
+
+function countStatuses(data, statuses) {
+  return (data?.summary?.byStatus || [])
+    .filter(item => statuses.includes(item.status))
+    .reduce((total, item) => total + item.count, 0);
+}
+
+function SummaryCard({ title, value, detail }) {
+  return <article className="min-w-0 rounded-2xl bg-white p-5 shadow-card ring-1 ring-slate-200">
+    <p className="text-xs font-semibold text-slate-500">{title}</p>
+    <p className="mt-2 truncate text-xl font-extrabold text-ink">{value}</p>
+    <p className="mt-1 text-xs text-slate-500">{detail}</p>
+  </article>;
 }
 
 function Loading() {
